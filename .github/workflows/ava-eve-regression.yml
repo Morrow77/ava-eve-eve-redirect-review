@@ -1,0 +1,556 @@
+name: Ava and Eve bounded Python regression
+run-name: ava-eve-ci-${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        required: true
+        type: string
+      plan_base64:
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: ava-eve-ci-${{ github.repository_id }}-${{ inputs.request_id }}
+  cancel-in-progress: false
+jobs:
+  ava-eve-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions: {}
+    steps:
+      - name: Run fixed isolated regression driver
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/ava-eve-ci-driver.py" <<'AVA_EVE_FIXED_DRIVER'
+          """Fixed, standalone GitHub CI driver. Only the product container executes input code.
+          
+          This file is copied verbatim into a literal workflow script. Keep it stdlib-only;
+          the driver never imports the product or a repository checkout on the runner.
+          """
+          from __future__ import annotations
+          
+          import asyncio
+          import base64
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import signal
+          import stat
+          import sys
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import uuid
+          import zipfile
+          from pathlib import Path
+          
+          WORKFLOW_PATH = '.github/workflows/ava-eve-regression.yml'
+          JOB_NAME = 'ava-eve-regression'
+          RUN_NAME_PREFIX = 'ava-eve-ci-'
+          RESULT_MARKER = 'AVA_EVE_' + 'CI_RESULT_V1:'
+          MARKER = RESULT_MARKER
+          IMAGE = 'python@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d'
+          MAX_PLAN_BYTES = 24000
+          MAX_LOG_BYTES = 1_000_000
+          MAX_OUTPUT_BYTES = 32000
+          CASE_SECONDS = 30
+          TOTAL_SECONDS = 300
+          ERROR_CODES = frozenset({'invalid_plan','runner_identity','public_source_unavailable','archive_mismatch',
+              'docker_unavailable','boundary_failed','execution_incomplete','cancelled','internal_error'})
+          
+          # Must remain byte-for-byte equal to the controller's BUNDLE_CLI_BOOTSTRAP.
+          BUNDLE_CLI_BOOTSTRAP = "\nimport base64,hashlib,json,os,pathlib,sys\ndata=json.loads(sys.stdin.buffer.read(256001))\nbase=pathlib.Path('/work')\narchive=base64.b64decode(data['archive'],validate=True)\nassert hashlib.sha256(archive).hexdigest()==data['archive_sha256']\nsource=base/'product.pyz'\nsource.write_bytes(archive)\nfor item in data['files']:\n    (base/item['name']).write_bytes(item['content'].encode('utf-8'))\nstdin=base/'stdin.bin'\nstdin.write_bytes(data['stdin'].encode('utf-8'))\nfd=os.open(stdin,os.O_RDONLY)\nos.dup2(fd,0,inheritable=True)\nif fd!=0:os.close(fd)\nos.execv(sys.executable,[sys.executable,'-I',str(source),*data['argv']])\n"
+          
+          PROBE = '''import json,os,pathlib,socket
+          checks={'uid':os.getuid()==65534,'socket_absent':not pathlib.Path('/var/run/docker.sock').exists(),
+          'host_absent':not pathlib.Path('/mnt/c/Users').exists(),'secrets_absent':not any(k in os.environ for k in
+          ['GITHUB_TOKEN','GH_TOKEN','ACTIONS_RUNTIME_TOKEN','OPENAI_API_KEY','STRIPE_SECRET_KEY']),
+          'no_new_privs':'NoNewPrivs:\\t1' in pathlib.Path('/proc/self/status').read_text()}
+          try:pathlib.Path('/root-check').write_text('probe');checks['root_read_only']=False
+          except OSError:checks['root_read_only']=True
+          pathlib.Path('/work/probe').write_text('probe');pathlib.Path('/work/probe').unlink();checks['scratch']=True
+          s=socket.socket();s.settimeout(1)
+          try:s.connect(('169.254.169.254',80));checks['network_blocked']=False
+          except OSError:checks['network_blocked']=True
+          print(json.dumps(checks,sort_keys=True))
+          '''
+          
+          
+          class CIError(ValueError):
+              def __init__(self, code):
+                  self.code = code if code in ERROR_CODES else 'internal_error'
+                  super().__init__(self.code)
+          
+          
+          def canonical(value):
+              return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')
+          
+          
+          def sha(value):
+              return hashlib.sha256(value).hexdigest()
+          
+          
+          def _match(value,pattern):
+              return isinstance(value,str) and re.fullmatch(pattern,value) is not None
+          
+          
+          def _text(value,limit):
+              if not isinstance(value,str) or '\x00' in value or len(value.encode('utf-8'))>limit:
+                  raise CIError('invalid_plan')
+          
+          
+          def _validate_cases(cases):
+              if not isinstance(cases,list) or not 1<=len(cases)<=6:raise CIError('invalid_plan')
+              names=set()
+              for case in cases:
+                  keys={'name','argv','stdin','files','expect_exit','stdout_equals','stdout_contains','stderr_equals','stderr_contains'}
+                  if not isinstance(case,dict) or set(case)-keys or not {'name','argv','expect_exit'}<=set(case):raise CIError('invalid_plan')
+                  _text(case['name'],320)
+                  if not 1<=len(case['name'])<=80 or case['name'] in names:raise CIError('invalid_plan')
+                  names.add(case['name'])
+                  if type(case['expect_exit']) is not int or not 0<=case['expect_exit']<=255:raise CIError('invalid_plan')
+                  argv=case['argv']
+                  if not isinstance(argv,list) or len(argv)>12:raise CIError('invalid_plan')
+                  for value in argv:_text(value,800)
+                  if any(len(v)>200 for v in argv):raise CIError('invalid_plan')
+                  _text(case.get('stdin',''),8000)
+                  files=case.get('files',[])
+                  if not isinstance(files,list) or len(files)>8:raise CIError('invalid_plan')
+                  seen=set();total=0
+                  for item in files:
+                      if (not isinstance(item,dict) or set(item)!={'name','content'} or not isinstance(item['name'],str)
+                          or not 1<=len(item['name'])<=80 or item['name'] in {'product.py','product.pyz','stdin.bin'}
+                          or item['name'].startswith('.') or any(c in item['name'] for c in '/\\:\x00\r\n')
+                          or item['name'].casefold() in seen):raise CIError('invalid_plan')
+                      _text(item['name'],320);_text(item['content'],32000)
+                      total+=len(item['content'].encode());seen.add(item['name'].casefold())
+                  if total>32000:raise CIError('invalid_plan')
+                  assertions=[k for k in case if k.startswith(('stdout_','stderr_'))]
+                  if not assertions:raise CIError('invalid_plan')
+                  for key in assertions:
+                      _text(case[key],2000 if key.endswith('_contains') else 16000 if key.startswith('stdout') else 8000)
+                      if key.endswith('_contains') and not case[key]:raise CIError('invalid_plan')
+          
+          
+          def validate_plan(plan):
+              try:
+                  keys={'version','request_id','repository','repository_id','workflow_head_sha','artifact','cases','cases_sha256'}
+                  if (not isinstance(plan,dict) or set(plan)!=keys or type(plan['version']) is not int or plan['version']!=1
+                      or not _match(plan['request_id'],r'ci_[a-f0-9]{32}')
+                      or not _match(plan['repository'],r'Morrow77/ava-eve-(?:ava|eve)-[A-Za-z0-9][A-Za-z0-9_.-]{0,80}')
+                      or type(plan['repository_id']) is not int or not 0<plan['repository_id']<2**63
+                      or not _match(plan['workflow_head_sha'],r'[a-f0-9]{40}')):raise CIError('invalid_plan')
+                  artifact=plan['artifact']
+                  if (not isinstance(artifact,dict) or set(artifact)!={'path','commit_sha','sha256','size','bundle_manifest_sha256'}
+                      or not _match(artifact['path'],r'(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,80}/){0,3}[A-Za-z0-9][A-Za-z0-9_.-]{0,90}\.pyz')
+                      or any(v in {'.','..'} or v.startswith('.') for v in artifact['path'].split('/'))
+                      or not _match(artifact['commit_sha'],r'[a-f0-9]{40}')
+                      or not _match(artifact['sha256'],r'[a-f0-9]{64}')
+                      or not _match(artifact['bundle_manifest_sha256'],r'[a-f0-9]{64}')
+                      or type(artifact['size']) is not int or not 1<=artifact['size']<=160000):raise CIError('invalid_plan')
+                  _validate_cases(plan['cases'])
+                  if plan['cases_sha256']!=sha(canonical(plan['cases'])) or len(canonical(plan))>MAX_PLAN_BYTES:raise CIError('invalid_plan')
+                  return json.loads(canonical(plan))
+              except (KeyError,TypeError,UnicodeError,OverflowError,ValueError) as error:
+                  if isinstance(error,CIError):raise
+                  raise CIError('invalid_plan') from None
+          
+          
+          def prepare_plan(*,request_id,repository,repository_id,workflow_head_sha,artifact_path,artifact_commit_sha,
+                           artifact_sha256,artifact_size,bundle_manifest_sha256,cases):
+              return validate_plan({'version':1,'request_id':request_id,'repository':repository,'repository_id':repository_id,
+                  'workflow_head_sha':workflow_head_sha,'artifact':{'path':artifact_path,'commit_sha':artifact_commit_sha,
+                      'sha256':artifact_sha256,'size':artifact_size,'bundle_manifest_sha256':bundle_manifest_sha256},
+                  'cases':cases,'cases_sha256':sha(canonical(cases))})
+          
+          
+          def encode_plan(plan):
+              return base64.b64encode(canonical(validate_plan(plan))).decode('ascii')
+          
+          
+          def _inputs(event):
+              values=event.get('inputs') if isinstance(event,dict) else None
+              if not isinstance(values,dict) or set(values)!={'request_id','plan_base64'}:raise CIError('invalid_plan')
+              encoded=values['plan_base64']
+              if not isinstance(encoded,str) or len(encoded)>32000:raise CIError('invalid_plan')
+              try:
+                  raw=base64.b64decode(encoded,validate=True)
+                  plan=validate_plan(json.loads(raw))
+              except (ValueError,UnicodeError):raise CIError('invalid_plan') from None
+              if raw!=canonical(plan) or values['request_id']!=plan['request_id']:raise CIError('invalid_plan')
+              return plan
+          
+          
+          def _runner(plan,env):
+              if (env.get('GITHUB_REPOSITORY')!=plan['repository'] or env.get('GITHUB_REPOSITORY_ID')!=str(plan['repository_id'])
+                  or env.get('GITHUB_SHA')!=plan['workflow_head_sha'] or env.get('GITHUB_RUN_ATTEMPT')!='1'
+                  or env.get('GITHUB_EVENT_NAME')!='workflow_dispatch' or not _match(env.get('GITHUB_RUN_ID'),r'[1-9][0-9]{0,19}')):
+                  raise CIError('runner_identity')
+              return env['GITHUB_RUN_ID']
+          
+          
+          class _NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs):return None
+          
+          
+          def _get(path,limit=350000):
+              # No proxy, cookies, authentication, redirect or caller-controlled origin.
+              opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),_NoRedirect())
+              request=urllib.request.Request('https://api.github.com'+path,headers={
+                  'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10','User-Agent':'ava-eve-bounded-ci-v1'})
+              try:
+                  with opener.open(request,timeout=20) as response:
+                      if response.status!=200:raise CIError('public_source_unavailable')
+                      raw=response.read(limit+1)
+                      if len(raw)>limit:raise CIError('public_source_unavailable')
+                  value=json.loads(raw)
+                  if not isinstance(value,dict):raise CIError('public_source_unavailable')
+                  return value
+              except (OSError,ValueError,urllib.error.URLError):raise CIError('public_source_unavailable') from None
+          
+          
+          def fetch_artifact(plan,get=_get):
+              repository=plan['repository'];artifact=plan['artifact']
+              info=get('/repos/'+repository)
+              if (info.get('id')!=plan['repository_id'] or info.get('full_name')!=repository
+                  or info.get('private') is not False or info.get('fork') is not False):raise CIError('public_source_unavailable')
+              value=get('/repos/'+repository+'/contents/'+urllib.parse.quote(artifact['path'],safe='/')+'?ref='+artifact['commit_sha'])
+              if (value.get('type')!='file' or value.get('path')!=artifact['path'] or value.get('size')!=artifact['size']
+                  or value.get('encoding')!='base64' or not isinstance(value.get('content'),str)
+                  or len(value['content'])>220000):raise CIError('archive_mismatch')
+              try:data=base64.b64decode(''.join(value['content'].split()),validate=True)
+              except ValueError:raise CIError('archive_mismatch') from None
+              _archive(data,artifact)
+              return data
+          
+          
+          def _archive(data,artifact):
+              if len(data)!=artifact['size'] or sha(data)!=artifact['sha256']:raise CIError('archive_mismatch')
+              try:
+                  with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                      entries=archive.infolist();seen=set();size=0;contents={}
+                      if not 1<=len(entries)<=100:raise CIError('archive_mismatch')
+                      for entry in entries:
+                          name=entry.filename;size+=entry.file_size
+                          if (not _match(name,r'[A-Za-z0-9_./-]{1,200}') or name.startswith('/')
+                              or any(p in {'','.','..'} for p in name.split('/')) or name.casefold() in seen
+                              or stat.S_IFMT(entry.external_attr>>16)!=stat.S_IFREG or entry.is_dir() or entry.flag_bits&1
+                              or entry.compress_type!=zipfile.ZIP_DEFLATED or not 0<=entry.file_size<=250000 or size>2_000_000):
+                              raise CIError('archive_mismatch')
+                          raw=archive.read(entry);raw.decode('utf-8');contents[name]=raw;seen.add(name.casefold())
+                      manifest=contents['BUNDLE.json']
+                      value=json.loads(manifest)
+                      if (sha(manifest)!=artifact['bundle_manifest_sha256'] or value.get('version')!=1
+                          or value.get('format')!='python_zipapp_v1' or canonical(value)!=manifest):raise CIError('archive_mismatch')
+                      members=value['members']
+                      if {m['path'] for m in members}!=set(contents)-{'BUNDLE.json'} or len(members)!=len(contents)-1:raise CIError('archive_mismatch')
+                      for item in members:
+                          raw=contents[item['path']]
+                          if item['sha256']!=sha(raw) or item['size']!=len(raw):raise CIError('archive_mismatch')
+              except (KeyError,TypeError,UnicodeError,ValueError,RuntimeError,zipfile.BadZipFile):raise CIError('archive_mismatch') from None
+          
+          
+          async def _capture(args,env,stdin=b'',*,timeout=30,limit=MAX_OUTPUT_BYTES):
+              process=await asyncio.create_subprocess_exec(*args,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
+                  stderr=asyncio.subprocess.PIPE,env=env)
+              output=[bytearray(),bytearray()];truncated=False;timed_out=False
+              async def drain(stream,bucket):
+                  nonlocal truncated
+                  while value:=await stream.read(8192):
+                      left=limit-len(bucket);bucket.extend(value[:max(left,0)])
+                      if len(value)>left:
+                          truncated=True
+                          if process.returncode is None:process.kill()
+              async def write():
+                  try:
+                      process.stdin.write(stdin);await process.stdin.drain();process.stdin.close()
+                  except (BrokenPipeError,ConnectionResetError):pass
+              try:
+                  try:
+                      async with asyncio.timeout(timeout):
+                          await asyncio.gather(write(),drain(process.stdout,output[0]),drain(process.stderr,output[1]),process.wait())
+                  except TimeoutError:timed_out=True
+              finally:
+                  if process.returncode is None:
+                      process.kill();await process.wait()
+              return process.returncode,bytes(output[0]),bytes(output[1]),truncated,timed_out
+          
+          
+          class DockerRuntime:
+              """Production entry point has no configurable command, image, host or flags."""
+              def __init__(self,request_id):
+                  executable=shutil.which('docker')
+                  if not executable:raise CIError('docker_unavailable')
+                  self.request_id=request_id;self.active=set();self.config=tempfile.TemporaryDirectory(prefix='ava-eve-ci-docker-')
+                  self.command=[executable,'--config',self.config.name,'--host','unix:///var/run/docker.sock']
+                  self.env={'PATH':os.environ.get('PATH',''),'LANG':'C.UTF-8'}
+          
+              async def _command(self,args,timeout=20):
+                  code,out,_err,truncated,timed_out=await _capture(self.command+args,self.env,timeout=timeout,limit=128000)
+                  if code or truncated or timed_out:raise CIError('docker_unavailable')
+                  return out
+          
+              def flags(self,name):
+                  return ['run','--rm','--interactive','--pull','never','--name',name,'--label','ava-eve.owner=ci-driver',
+                      '--label','ava-eve.request='+self.request_id,'--label','ava-eve.driver='+DRIVER_SHA256,
+                      '--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges=true',
+                      '--user','65534:65534','--cpus','1','--memory','512m','--memory-swap','512m','--pids-limit','64',
+                      '--ulimit','nofile=256:256','--log-driver','none','--no-healthcheck',
+                      '--tmpfs','/work:rw,nosuid,nodev,noexec,size=268435456,mode=1777',
+                      '--tmpfs','/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777','--workdir','/work',IMAGE]
+          
+              async def _kill(self,name):
+                  # Absence is observed explicitly; an engine/cleanup error is not absence.
+                  query=['ps','--all','--filter','name=^/'+name+'$','--format','{{.Names}}']
+                  names=(await self._command(query)).decode('ascii').splitlines()
+                  if names:
+                      if names!=[name]:raise CIError('boundary_failed')
+                      item=json.loads(await self._command(['inspect',name]))[0]
+                      labels=item.get('Config',{}).get('Labels',{})
+                      if (item.get('Name')!='/'+name or labels.get('ava-eve.owner')!='ci-driver'
+                          or labels.get('ava-eve.request')!=self.request_id or labels.get('ava-eve.driver')!=DRIVER_SHA256):
+                          raise CIError('boundary_failed')
+                      # An auto-removed container can disappear between list and inspect;
+                      # that remains unavailable evidence rather than swallowing an error.
+                      await self._command(['rm','--force',name])
+                      if (await self._command(query)).strip():raise CIError('boundary_failed')
+                  self.active.discard(name)
+          
+              async def _run(self,bootstrap,payload,timeout):
+                  name='ava-eve-ci-'+uuid.uuid4().hex;self.active.add(name)
+                  try:
+                      return await _capture(self.command+self.flags(name)+['python','-I','-c',bootstrap],self.env,payload,timeout=timeout)
+                  finally:
+                      await self._kill(name)
+          
+              async def prepare(self):
+                  engine=json.loads(await self._command(['version','--format','{{json .Server}}']))
+                  if engine.get('Os')!='linux':raise CIError('boundary_failed')
+                  await self._command(['pull',IMAGE],timeout=120)
+                  item=json.loads(await self._command(['image','inspect',IMAGE]))[0]
+                  if item.get('Config',{}).get('Volumes') or item.get('Config',{}).get('Entrypoint') or IMAGE not in item.get('RepoDigests',[]):
+                      raise CIError('boundary_failed')
+                  code,out,_err,truncated,timed_out=await self._run(PROBE,b'',15)
+                  observed=json.loads(out)
+                  if (code or truncated or timed_out or set(observed)!={'uid','socket_absent','host_absent','secrets_absent','no_new_privs','root_read_only','scratch','network_blocked'}
+                      or not all(v is True for v in observed.values())):raise CIError('boundary_failed')
+          
+              async def case(self,data,case):
+                  payload=canonical({'archive':base64.b64encode(data).decode(),'archive_sha256':sha(data),
+                      'argv':case['argv'],'stdin':case.get('stdin',''),'files':case.get('files',[])})
+                  if len(payload)>256000:raise CIError('invalid_plan')
+                  return await self._run(BUNDLE_CLI_BOOTSTRAP,payload,CASE_SECONDS)
+          
+              async def close(self):
+                  for name in list(self.active):await self._kill(name)
+                  self.config.cleanup()
+          
+          
+          def _valid_utf8(value):
+              try:return value.decode('utf-8'),True
+              except UnicodeError:return '',False
+          
+          
+          def _result_base(plan,run_id):
+              return {'version':1,'request_id':plan['request_id'],'repository':plan['repository'],'repository_id':plan['repository_id'],
+                  'run_id':run_id,'run_attempt':1,'workflow_head_sha':plan['workflow_head_sha'],'plan_sha256':sha(canonical(plan)),
+                  'artifact_sha256':plan['artifact']['sha256'],'bundle_manifest_sha256':plan['artifact']['bundle_manifest_sha256'],
+                  'cases_sha256':plan['cases_sha256'],'image':IMAGE,'bootstrap_sha256':BOOTSTRAP_SHA256,'driver_sha256':DRIVER_SHA256,
+                  'workflow_sha256':WORKFLOW_SHA256,'environment_sha256':ENVIRONMENT_SHA256,'status':'unavailable','error_code':None,'cases':[]}
+          
+          
+          async def execute_plan(plan,env,*,fetch=fetch_artifact,runtime_factory=DockerRuntime):
+              """Test seams are trusted Python callables, never fields accepted by main()."""
+              plan=validate_plan(plan);run_id=_runner(plan,env);result=_result_base(plan,run_id);runtime=None
+              try:
+                  async with asyncio.timeout(TOTAL_SECONDS):
+                      data=await asyncio.to_thread(fetch,plan)
+                      _archive(data,plan['artifact'])
+                      runtime=runtime_factory(plan['request_id']);await runtime.prepare()
+                      for index,case in enumerate(plan['cases']):
+                          started=time.monotonic();code,out,err,truncated,timed_out=await runtime.case(data,case)
+                          stdout,valid_out=_valid_utf8(out);stderr,valid_err=_valid_utf8(err)
+                          assertions=[]
+                          for key in sorted(case):
+                              if not key.startswith(('stdout_','stderr_')):continue
+                              stream,operator=key.split('_',1);raw=out if stream=='stdout' else err
+                              actual=stdout if stream=='stdout' else stderr;valid=valid_out if stream=='stdout' else valid_err
+                              expected=case[key]
+                              passed=bool(valid and not truncated and not timed_out and (sha(raw)==sha(expected.encode()) if operator=='equals' else expected in actual))
+                              assertions.append({'stream':stream,'operator':operator,'expected_sha256':sha(expected.encode()),'passed':passed})
+                          result['cases'].append({'index':index,'passed':bool(code==case['expect_exit'] and valid_out and valid_err and not truncated and not timed_out and all(a['passed'] for a in assertions)),
+                              'exit_code':code,'expected_exit':case['expect_exit'],'stdout_sha256':sha(out),'stderr_sha256':sha(err),
+                              'stdout_utf8_valid':valid_out,'stderr_utf8_valid':valid_err,'output_truncated':truncated,'timed_out':timed_out,
+                              'duration_ms':int((time.monotonic()-started)*1000),'assertions':assertions})
+                          if timed_out or truncated:raise CIError('execution_incomplete')
+                      result['status']='passed' if all(c['passed'] for c in result['cases']) else 'failed'
+              except asyncio.CancelledError:
+                  result['error_code']='cancelled'
+                  raise
+              except (CIError,OSError,ValueError,TimeoutError) as error:
+                  result['error_code']=error.code if isinstance(error,CIError) else 'execution_incomplete'
+              finally:
+                  if runtime is not None:
+                      try:await runtime.close()
+                      except (CIError,OSError,ValueError):
+                          result['status']='unavailable';result['error_code']='boundary_failed'
+              return result
+          
+          
+          def parse_result(text,expected_plan,*,run_id):
+              plan=validate_plan(expected_plan)
+              if not _match(str(run_id),r'[1-9][0-9]{0,19}'):raise CIError('runner_identity')
+              if isinstance(text,bytes):
+                  if len(text)>MAX_LOG_BYTES:raise CIError('execution_incomplete')
+                  try:text=text.decode('utf-8')
+                  except UnicodeError:raise CIError('execution_incomplete') from None
+              if not isinstance(text,str) or len(text.encode())>MAX_LOG_BYTES:raise CIError('execution_incomplete')
+              pattern=r'^(?:[0-9]{4}-[0-9T:.+-]+Z?\s+)?'+re.escape(RESULT_MARKER)+r'([A-Za-z0-9+/=]+)\s*$'
+              markers=[m[1] for line in text.splitlines() if (m:=re.fullmatch(pattern,line))]
+              if len(markers)!=1 or len(markers[0])>24000:raise CIError('execution_incomplete')
+              try:
+                  raw=base64.b64decode(markers[0],validate=True);value=json.loads(raw)
+                  if raw!=canonical(value):raise CIError('execution_incomplete')
+                  base=_result_base(plan,str(run_id))
+                  if (not isinstance(value,dict) or set(value)!=set(base)
+                      or any(type(value[k]) is not type(v) or value[k]!=v for k,v in base.items() if k not in {'status','error_code','cases'})):
+                      raise CIError('runner_identity')
+                  if value['status'] not in {'passed','failed','unavailable'} or (value['error_code'] is not None and value['error_code'] not in ERROR_CODES):raise CIError('execution_incomplete')
+                  outcomes=value['cases']
+                  if not isinstance(outcomes,list) or len(outcomes)>len(plan['cases']):raise CIError('execution_incomplete')
+                  for index,outcome in enumerate(outcomes):
+                      expected=plan['cases'][index]
+                      if set(outcome)!={'index','passed','exit_code','expected_exit','stdout_sha256','stderr_sha256','stdout_utf8_valid','stderr_utf8_valid','output_truncated','timed_out','duration_ms','assertions'}:
+                          raise CIError('execution_incomplete')
+                      if (type(outcome['index']) is not int or outcome['index']!=index or type(outcome['expected_exit']) is not int or outcome['expected_exit']!=expected['expect_exit']
+                          or type(outcome['exit_code']) is not int or not -255<=outcome['exit_code']<=255
+                          or type(outcome['duration_ms']) is not int or not 0<=outcome['duration_ms']<=360000
+                          or any(type(outcome[k]) is not bool for k in ('passed','stdout_utf8_valid','stderr_utf8_valid','output_truncated','timed_out'))
+                          or any(not _match(outcome[k],r'[a-f0-9]{64}') for k in ('stdout_sha256','stderr_sha256'))):raise CIError('execution_incomplete')
+                      specifications=[(key.split('_')[0],key.split('_')[1],sha(expected[key].encode())) for key in sorted(expected) if key.startswith(('stdout_','stderr_'))]
+                      assertions=outcome['assertions']
+                      if not isinstance(assertions,list) or len(assertions)!=len(specifications):raise CIError('execution_incomplete')
+                      for item,spec in zip(assertions,specifications,strict=True):
+                          if (not isinstance(item,dict) or set(item)!={'stream','operator','expected_sha256','passed'}
+                              or (item['stream'],item['operator'],item['expected_sha256'])!=spec or type(item['passed']) is not bool):raise CIError('execution_incomplete')
+                          if item['operator']=='equals' and item['passed'] and outcome[item['stream']+'_sha256']!=item['expected_sha256']:raise CIError('execution_incomplete')
+                      passed=bool(outcome['exit_code']==expected['expect_exit'] and outcome['stdout_utf8_valid'] and outcome['stderr_utf8_valid']
+                          and not outcome['output_truncated'] and not outcome['timed_out'] and all(a['passed'] for a in assertions))
+                      if outcome['passed'] is not passed:raise CIError('execution_incomplete')
+                  if value['status']!='unavailable':
+                      if value['error_code'] is not None or len(outcomes)!=len(plan['cases']):raise CIError('execution_incomplete')
+                      if value['status']!=('passed' if all(c['passed'] for c in outcomes) else 'failed'):raise CIError('execution_incomplete')
+                  elif value['error_code'] is None:raise CIError('execution_incomplete')
+                  return value
+              except (KeyError,TypeError,ValueError,UnicodeError) as error:
+                  if isinstance(error,CIError):raise
+                  raise CIError('execution_incomplete') from None
+          
+          
+          parse_marker=parse_result
+          
+          
+          def retained_evidence(plan,result):
+              """Bind a verified fixed-driver result to its protected input definitions."""
+              plan=validate_plan(plan)
+              parsed=parse_result(RESULT_MARKER+base64.b64encode(canonical(result)).decode(),plan,run_id=result.get('run_id'))
+              if parsed['status'] not in {'passed','failed'}:raise CIError('execution_incomplete')
+              cases=[]
+              for expected,outcome in zip(plan['cases'],parsed['cases'],strict=True):
+                  cases.append({**outcome,'name':expected['name'],'argv':expected['argv'],
+                      'stdin_sha256':sha(expected.get('stdin','').encode()),
+                      'files':[{'name':item['name'],'sha256':sha(item['content'].encode()),'size':len(item['content'].encode())}
+                               for item in expected.get('files',[])]})
+              return {'artifact_sha256':plan['artifact']['sha256'],'bundle_manifest_sha256':plan['artifact']['bundle_manifest_sha256'],
+                  'artifact_format':'python_zipapp_v1','cases':cases,'case_count':len(cases),'passed':parsed['status']=='passed',
+                  'runtime_environment':json.loads(canonical(RUNTIME_ENVIRONMENT)),'environment_sha256':ENVIRONMENT_SHA256,
+                  'evidence_source':'controller','evidence_level':'hosted-result-verified'}
+          
+          
+          def normalize_driver_source(raw):
+              source=raw.decode('utf-8').replace('\r\n','\n').replace('\r','\n')
+              return (source if source.endswith('\n') else source+'\n').encode('utf-8')
+          
+          
+          def workflow_bytes(driver_bytes=None):
+              source=normalize_driver_source(driver_bytes if driver_bytes is not None else DRIVER_BYTES).decode('utf-8')
+              # Input strings are read from the runner event file. They never become shell,
+              # step env, argv or a runner preamble that would expose test fixtures.
+              header='''name: Ava and Eve bounded Python regression
+          run-name: ava-eve-ci-@REQUEST@
+          on:
+            workflow_dispatch:
+              inputs:
+                request_id:
+                  required: true
+                  type: string
+                plan_base64:
+                  required: true
+                  type: string
+          permissions: {}
+          concurrency:
+            group: ava-eve-ci-@REPOSITORY@-@REQUEST@
+            cancel-in-progress: false
+          jobs:
+            ava-eve-regression:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 8
+              permissions: {}
+              steps:
+                - name: Run fixed isolated regression driver
+                  shell: bash
+                  run: |
+                    cat > "$RUNNER_TEMP/ava-eve-ci-driver.py" <<'AVA_EVE_FIXED_DRIVER'
+          '''
+              # Do not place an expression token in this literal driver: GitHub evaluates
+              # expressions even within shell here-documents, which would alter its hash.
+              header=header.replace('@REQUEST@','$'+'{{ inputs.request_id }}').replace('@REPOSITORY@','$'+'{{ github.repository_id }}')
+              tail='''          AVA_EVE_FIXED_DRIVER
+                    python3 "$RUNNER_TEMP/ava-eve-ci-driver.py"
+          '''
+              return (header+''.join('          '+line+'\n' for line in source.split('\n')[:-1])+tail).encode('utf-8')
+          
+          
+          DRIVER_BYTES=normalize_driver_source(Path(__file__).read_bytes())
+          DRIVER_SHA256=sha(DRIVER_BYTES)
+          BOOTSTRAP_SHA256=sha(BUNDLE_CLI_BOOTSTRAP.encode())
+          WORKFLOW_BYTES=workflow_bytes(DRIVER_BYTES)
+          WORKFLOW_SHA256=sha(WORKFLOW_BYTES)
+          TEMPLATE_SHA256=WORKFLOW_SHA256
+          RUNTIME_ENVIRONMENT={'version':3,'image':IMAGE,'bootstrap_sha256':BOOTSTRAP_SHA256,
+              'driver_sha256':DRIVER_SHA256,'workflow_sha256':WORKFLOW_SHA256,'scope':'github-public-standard-ubuntu-24.04'}
+          # The fixed driver/workflow hashes bind all resource/transport/output restrictions.
+          ENVIRONMENT_SHA256=sha(canonical(RUNTIME_ENVIRONMENT))
+          
+          
+          def main():
+              result={'version':1,'status':'unavailable','error_code':'invalid_plan'}
+              try:
+                  path=Path(os.environ['GITHUB_EVENT_PATH'])
+                  if path.is_symlink() or not path.is_file() or path.stat().st_size>128000:raise CIError('invalid_plan')
+                  with path.open('rb') as stream:raw=stream.read(128001)
+                  if len(raw)>128000:raise CIError('invalid_plan')
+                  plan=_inputs(json.loads(raw));run_id=_runner(plan,os.environ)
+                  result=_result_base(plan,run_id)
+                  async def run():
+                      loop=asyncio.get_running_loop();task=asyncio.current_task()
+                      for sig in (signal.SIGINT,signal.SIGTERM):loop.add_signal_handler(sig,task.cancel)
+                      return await execute_plan(plan,os.environ)
+                  result=asyncio.run(run())
+              except (asyncio.CancelledError,KeyboardInterrupt):result['error_code']='cancelled'
+              except Exception as error:  # noqa: BLE001 - never emit runner/environment/provider exception contents
+                  result['error_code']=error.code if isinstance(error,CIError) else 'internal_error'
+              print(RESULT_MARKER+base64.b64encode(canonical(result)).decode('ascii'),flush=True)
+              return 0 if result.get('status')=='passed' else 1
+          
+          
+          if __name__=='__main__':
+              sys.exit(main())
+          AVA_EVE_FIXED_DRIVER
+          python3 "$RUNNER_TEMP/ava-eve-ci-driver.py"
