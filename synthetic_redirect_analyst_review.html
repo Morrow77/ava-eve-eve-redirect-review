@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sample redirect mapping review</title>
+<style>body{font-family:"Source Sans 3",sans-serif;color:#202c35;max-width:1100px;margin:48px auto;padding:0 24px;line-height:1.6}h1,h2{line-height:1.2}table{border-collapse:collapse;width:100%;margin:24px 0}th,td{text-align:left;vertical-align:top;padding:14px;border-bottom:1px solid #c8d1d6}th{background:#edf2f4}pre{background:#edf2f4;padding:20px;overflow:auto}small{color:#52616b}@media(max-width:700px){table{display:block;overflow:auto}body{margin:24px auto}}</style>
+<h1>Sample redirect mapping review</h1>
+<p>Synthetic demonstration prepared 12 November 2026. All six mappings were invented for this sample.</p>
+<h2>Review result</h2>
+<p>Resolve three mapping issues before implementation. The checker produced six findings because the conflict and loop each generate related diagnostic entries. Row references include the header as row 1.</p>
+<table><thead><tr><th>Priority</th><th>CSV rows</th><th>Finding</th><th>Suggested action</th><th>Decision needed</th></tr></thead><tbody>
+<tr><td>Resolve</td><td>4–5</td><td>/old-contact has two targets, /contact and /contact-us. Its destination is indeterminate.</td><td>Retain one mapping after confirming the intended replacement page.</td><td>Agency content owner selects the replacement.</td></tr>
+<tr><td>Resolve</td><td>6–7</td><td>/loop-a and /loop-b point to each other. Both also produce chain-step findings.</td><td>Replace both destinations with approved final pages, or remove the redirect definitions if those paths should serve content.</td><td>Confirm the intended content and final destination for each path.</td></tr>
+<tr><td>Review</td><td>2–3</td><td>/old-service points to /service, which points to /services.</td><td>If /services is the approved equivalent final page, change row 2 to /old-service,/services and retain row 3 for visitors to /service.</td><td>Confirm equivalence and any intentional intermediate behavior.</td></tr>
+</tbody></table>
+<p>The conflict needs a content decision. CSV row order alone cannot establish the intended destination. For the loop, final targets remain pending. The chain change is conditional on confirming the intended replacement.</p>
+<h2>Supplied sample</h2>
+<pre>source,target
+/old-service,/service
+/service,/services
+/old-contact,/contact
+/old-contact,/contact-us
+/loop-a,/loop-b
+/loop-b,/loop-a</pre>
+<h2>Implementation follow-up</h2>
+<p>After the content owner approves destinations, update the mapping and rerun the offline review. Check host aliases, query parameters, percent encoding and path case against the intended server rules.</p>
+<p>On staging or the deployed site, request each old URL and record the response status, each redirect hop and final URL. Confirm the final page serves the intended content and has the expected indexability and canonical settings. Those response and content checks remain pending in this sample.</p>
+<h2>Method and limits</h2>
+<p>The packaged redirect_check_v4.pyz processed the sample as an actual Linux Python process. Complete JSON output, empty stderr and exit status 0 matched the recorded assertions in cli_ef7ccc43be5e424d8544a69ef8835b67. Matching uses exact strings after trimming surrounding whitespace.</p>
+<p>This review covers the supplied CSV. Destination availability, server rule precedence, content equivalence and SEO outcomes require additional evidence. The package requires Python 3.12 or later. Full 2 MB input boundary and Windows/Excel compatibility remain unverified.</p>
+<p>The complete recorded JSON remains in the companion synthetic_redirect_analyst_review.md, artifact_8bd76b3aed9342e49fb5126b90f480eb.</p>
+</html>
